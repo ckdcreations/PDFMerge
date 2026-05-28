@@ -3,7 +3,13 @@ import PDFKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @State private var pdfURLs: [URL] = []
+    private struct PDFItem: Identifiable, Equatable {
+        let id = UUID()
+        let url: URL
+    }
+
+    @State private var pdfItems: [PDFItem] = []
+    @State private var selectedItemID: PDFItem.ID?
     @State private var isTargeted = false
     @State private var errorMessage: String?
     @State private var showError = false
@@ -34,21 +40,22 @@ struct ContentView: View {
                 } label: {
                     Label("Sort", systemImage: "arrow.up.arrow.down")
                 }
-                .disabled(pdfURLs.count < 2)
+                .disabled(pdfItems.count < 2)
 
                 Spacer()
 
                 Button("Clear All", role: .destructive) {
-                    pdfURLs.removeAll()
+                    pdfItems.removeAll()
+                    selectedItemID = nil
                 }
-                .disabled(pdfURLs.isEmpty)
+                .disabled(pdfItems.isEmpty)
 
                 Button {
                     mergeAndSave()
                 } label: {
                     Label("Merge & Save", systemImage: "doc.on.doc")
                 }
-                .disabled(pdfURLs.count < 2 || isMerging)
+                .disabled(pdfItems.count < 2 || isMerging)
                 .keyboardShortcut("s", modifiers: .command)
             }
             .padding()
@@ -57,7 +64,7 @@ struct ContentView: View {
 
             // Drop zone / file list
             Group {
-                if pdfURLs.isEmpty {
+                if pdfItems.isEmpty {
                     dropPlaceholder
                 } else {
                     fileList
@@ -100,30 +107,72 @@ struct ContentView: View {
 
     private var fileList: some View {
         List {
-            ForEach(Array(pdfURLs.enumerated()), id: \.offset) { index, url in
+            ForEach(Array(pdfItems.enumerated()), id: \.element.id) { index, item in
+                let isSelected = item.id == selectedItemID
+
                 HStack {
                     Image(systemName: "doc.fill")
                         .foregroundStyle(.red)
                     VStack(alignment: .leading) {
-                        Text(url.lastPathComponent)
+                        Text(item.url.lastPathComponent)
                             .lineLimit(1)
-                        Text(url.deletingLastPathComponent().path(percentEncoded: false))
+                        Text(item.url.deletingLastPathComponent().path(percentEncoded: false))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                     Spacer()
-                    Text("\(pageCount(for: url)) pages")
+                    Text("\(pageCount(for: item.url)) pages")
                         .foregroundStyle(.secondary)
                         .font(.caption)
+
+                    if isSelected {
+                        HStack(spacing: 10) {
+                            Button {
+                                moveItemUp(id: item.id)
+                            } label: {
+                                Image(systemName: "arrow.up.circle")
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(index == 0)
+                            .help("Move up")
+
+                            Button {
+                                moveItemDown(id: item.id)
+                            } label: {
+                                Image(systemName: "arrow.down.circle")
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(index == pdfItems.count - 1)
+                            .help("Move down")
+
+                            Button {
+                                removeItems(at: IndexSet(integer: index))
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Remove this file")
+                        }
+                        .foregroundStyle(.secondary)
+                    }
                 }
                 .padding(.vertical, 2)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+                .background {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.clear)
+                }
+                .onTapGesture {
+                    selectedItemID = item.id
+                }
             }
             .onMove { from, to in
-                pdfURLs.move(fromOffsets: from, toOffset: to)
+                pdfItems.move(fromOffsets: from, toOffset: to)
             }
             .onDelete { offsets in
-                pdfURLs.remove(atOffsets: offsets)
+                removeItems(at: offsets)
             }
         }
     }
@@ -149,7 +198,13 @@ struct ContentView: View {
             }
             return type.conforms(to: pdfType)
         }
-        pdfURLs.append(contentsOf: newPDFs)
+        let newItems = newPDFs.map { PDFItem(url: $0) }
+
+        pdfItems.append(contentsOf: newItems)
+
+        if selectedItemID == nil {
+            selectedItemID = newItems.first?.id
+        }
     }
 
     private func mergeAndSave() {
@@ -157,7 +212,7 @@ struct ContentView: View {
         defer { isMerging = false }
 
         do {
-            let merged = try PDFMerger.merge(urls: pdfURLs)
+            let merged = try PDFMerger.merge(urls: pdfItems.map(\.url))
 
             let savePanel = NSSavePanel()
             savePanel.allowedContentTypes = [.pdf]
@@ -180,34 +235,70 @@ struct ContentView: View {
     // MARK: - Sorting
 
     private func sortByName(ascending: Bool) {
-        pdfURLs.sort { a, b in
-            let result = a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
+        pdfItems.sort { a, b in
+            let result = a.url.lastPathComponent.localizedStandardCompare(b.url.lastPathComponent) == .orderedAscending
             return ascending ? result : !result
         }
     }
 
     private func sortByDate(ascending: Bool) {
-        pdfURLs.sort { a, b in
-            let dateA = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-            let dateB = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+        pdfItems.sort { a, b in
+            let dateA = (try? a.url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let dateB = (try? b.url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
             return ascending ? dateA < dateB : dateA > dateB
         }
     }
 
     private func sortByPageCount(ascending: Bool) {
-        pdfURLs.sort { a, b in
-            let pagesA = pageCount(for: a)
-            let pagesB = pageCount(for: b)
+        pdfItems.sort { a, b in
+            let pagesA = pageCount(for: a.url)
+            let pagesB = pageCount(for: b.url)
             return ascending ? pagesA < pagesB : pagesA > pagesB
         }
     }
 
     private func sortByFileSize(ascending: Bool) {
-        pdfURLs.sort { a, b in
-            let sizeA = (try? a.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-            let sizeB = (try? b.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        pdfItems.sort { a, b in
+            let sizeA = (try? a.url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            let sizeB = (try? b.url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
             return ascending ? sizeA < sizeB : sizeA > sizeB
         }
+    }
+
+    private func removeItems(at offsets: IndexSet) {
+        let nextSelectionIndex = offsets.min().flatMap { min($0, pdfItems.count - offsets.count - 1) }
+
+        pdfItems.remove(atOffsets: offsets)
+
+        guard let selectedItemID else {
+            return
+        }
+
+        if pdfItems.contains(where: { $0.id == selectedItemID }) {
+            return
+        }
+
+        if let nextSelectionIndex, pdfItems.indices.contains(nextSelectionIndex) {
+            self.selectedItemID = pdfItems[nextSelectionIndex].id
+        } else {
+            self.selectedItemID = nil
+        }
+    }
+
+    private func moveItemUp(id: PDFItem.ID) {
+        guard let index = pdfItems.firstIndex(where: { $0.id == id }), index > 0 else {
+            return
+        }
+
+        pdfItems.swapAt(index, index - 1)
+    }
+
+    private func moveItemDown(id: PDFItem.ID) {
+        guard let index = pdfItems.firstIndex(where: { $0.id == id }), index < pdfItems.count - 1 else {
+            return
+        }
+
+        pdfItems.swapAt(index, index + 1)
     }
 
     private func pageCount(for url: URL) -> Int {
